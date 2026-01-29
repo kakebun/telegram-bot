@@ -26,9 +26,9 @@ ALLOWED_TICKERS = {"META", "SNAP", "PINS"}
 HISTORY_PERIOD = "6mo"
 INTERVAL = "1d"
 
-FORECAST_DAYS = 7          # <-- 7 дней вперёд
-NEWS_LOOKBACK_DAYS = 7     # новости за последние 7 дней
-NEWS_LIMIT = 12            # сколько новостей брать максимум
+PREDICT_DAYS_7D = 7         # <-- 7 дней вперёд
+NEWS_LOOKBACK_DAYS = 7      # новости за последние 7 дней
+NEWS_LIMIT = 12             # сколько новостей брать максимум
 
 # кэш чтобы не ловить 429 / не ддосить Yahoo
 CACHE_TTL_SECONDS = 60
@@ -40,7 +40,7 @@ analyzer = SentimentIntensityAnalyzer()
 # ======================
 # HELPERS
 # ======================
-def cache_get(key):
+def cache_get(key: str):
     item = _cache.get(key)
     if not item:
         return None
@@ -50,7 +50,7 @@ def cache_get(key):
         return None
     return val
 
-def cache_set(key, val):
+def cache_set(key: str, val):
     _cache[key] = (time.time(), val)
 
 def sanitize_md(text: str) -> str:
@@ -71,11 +71,11 @@ def main_menu():
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         InlineKeyboardButton("📊 Predict META (1D)", callback_data="predict1_META"),
-        InlineKeyboardButton("📅 Forecast META (7D)", callback_data="predict7_META"),
+        InlineKeyboardButton("📅 Predict META (7D)", callback_data="predict7_META"),
         InlineKeyboardButton("📊 Predict SNAP (1D)", callback_data="predict1_SNAP"),
-        InlineKeyboardButton("📅 Forecast SNAP (7D)", callback_data="predict7_SNAP"),
+        InlineKeyboardButton("📅 Predict SNAP (7D)", callback_data="predict7_SNAP"),
         InlineKeyboardButton("📊 Predict PINS (1D)", callback_data="predict1_PINS"),
-        InlineKeyboardButton("📅 Forecast PINS (7D)", callback_data="predict7_PINS"),
+        InlineKeyboardButton("📅 Predict PINS (7D)", callback_data="predict7_PINS"),
         InlineKeyboardButton("ℹ️ Status", callback_data="status"),
     )
     return keyboard
@@ -101,6 +101,7 @@ def fetch_price_df(ticker: str) -> pd.DataFrame:
         progress=False
     )
 
+    # иногда yfinance отдаёт MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
@@ -193,11 +194,11 @@ def score_news_titles(news: list[dict], lookback_days: int = 7, limit: int = 10)
 
 
 # ======================
-# MODEL (Linear Regression) + FORECAST
+# MODEL (Linear Regression) + PREDICT
 # ======================
-def forecast_prices(ticker: str, days: int = 7):
+def predict_prices(ticker: str, days: int = 7):
     """
-    Делает прогноз на N будущих торговых дней.
+    Делает предикт на N будущих торговых дней.
     Возвращает:
       - preds: list[float] длины days
       - last_price: float
@@ -238,7 +239,7 @@ def build_1d_text(ticker: str, predicted: float, last_price: float, r2: float, e
     kz_time = datetime.now(timezone.utc) + timedelta(hours=5)
 
     return (
-        f"*{ticker} Prediction (1 Day)*\n\n"
+        f"*{ticker} Predict (1D)*\n\n"
         f"Last close: `{last_price:.2f}`\n"
         f"Predicted next close: `{predicted:.2f}`\n"
         f"Direction: {direction}\n"
@@ -257,15 +258,15 @@ def build_7d_text(ticker: str, preds: list[float], last_price: float, r2: float,
     for d, p in zip(future_dates, preds):
         lines.append(f"• {d.strftime('%Y-%m-%d')}: `{p:.2f}`")
 
-    forecast_block = "\n".join(lines)
+    predict_block = "\n".join(lines)
 
     return (
-        f"*{ticker} Forecast (7 Trading Days)*\n\n"
+        f"*{ticker} Predict (7D)*\n\n"
         f"Last close: `{last_price:.2f}`\n"
-        f"Day 7 forecast: `{day7:.2f}`\n"
+        f"Day 7 prediction: `{day7:.2f}`\n"
         f"Direction (vs last): {direction}\n"
         f"Confidence (R²): `{r2*100:.1f}%`\n\n"
-        f"*Next 7 predicted closes:*\n{forecast_block}\n\n"
+        f"*Next 7 predicted closes:*\n{predict_block}\n\n"
         f"{explanation_block}\n\n"
         f"⏱ {kz_time.strftime('%Y-%m-%d %H:%M')}"
     )
@@ -319,7 +320,6 @@ def build_explanation(ticker: str, slope: float, news_avg: float, pos, neg, used
             title = sanitize_md(x["title"])
             score = x["score"]
             publisher = sanitize_md(x.get("publisher", ""))
-            # link оставляем как есть (Telegram покажет)
             link = x.get("link", "")
             out.append(f"• `{score:+.2f}` — {title} ({publisher})\n  {link}")
         return "\n".join(out)
@@ -334,30 +334,34 @@ def build_explanation(ticker: str, slope: float, news_avg: float, pos, neg, used
         f"• {final}"
     ]
 
-    # добавим 1 блок новостей (чтобы не было слишком длинно)
     if used_count > 0:
         parts.append("")
         parts.append(pos_block)
         parts.append("")
         parts.append(neg_block)
 
-    return "\n".join([p for p in parts if p is not None and p != ""])
+    return "\n".join([p for p in parts if p])
 
 
 # ======================
 # CORE ACTIONS
 # ======================
 def do_predict_1d(ticker: str) -> str:
-    preds, last_price, r2, slope, dates = forecast_prices(ticker, days=1)
+    preds, last_price, r2, slope, _dates = predict_prices(ticker, days=1)
     news = fetch_news_yahoo(ticker)
-    news_avg, top_pos, top_neg, used_count = score_news_titles(news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT)
+    news_avg, top_pos, top_neg, used_count = score_news_titles(
+        news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT
+    )
     explanation = build_explanation(ticker, slope, news_avg, top_pos, top_neg, used_count)
     return build_1d_text(ticker, preds[0], last_price, r2, explanation)
 
+
 def do_predict_7d(ticker: str) -> str:
-    preds, last_price, r2, slope, dates = forecast_prices(ticker, days=FORECAST_DAYS)
+    preds, last_price, r2, slope, dates = predict_prices(ticker, days=PREDICT_DAYS_7D)
     news = fetch_news_yahoo(ticker)
-    news_avg, top_pos, top_neg, used_count = score_news_titles(news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT)
+    news_avg, top_pos, top_neg, used_count = score_news_titles(
+        news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT
+    )
     explanation = build_explanation(ticker, slope, news_avg, top_pos, top_neg, used_count)
     return build_7d_text(ticker, preds, last_price, r2, dates, explanation)
 
@@ -372,7 +376,7 @@ def start(message):
         "👋 *Hello!*\n\n"
         "You are using *Predict AI* — a Telegram bot that predicts short-term stock moves.\n\n"
         "📌 *Now it can:*\n"
-        "• Forecast *1 day* or *7 trading days*\n"
+        "• Predict *1 day (1D)* or *7 trading days (7D)*\n"
         "• Pull prices from *Yahoo Finance*\n"
         "• Pull recent *news headlines* from Yahoo via yfinance\n"
         "• Explain direction using *trend + news sentiment*\n\n"
@@ -382,13 +386,15 @@ def start(message):
         parse_mode="Markdown"
     )
 
+
 @bot.message_handler(commands=["status"])
 def status(message):
     bot.reply_to(
         message,
         f"✅ Bot RUNNING\nSource: Yahoo Finance\nTickers: {', '.join(sorted(ALLOWED_TICKERS))}\n"
-        f"Forecast: 1D + 7D\nNews: yfinance headlines"
+        f"Mode: Predict 1D + Predict 7D\nNews: yfinance headlines"
     )
+
 
 @bot.message_handler(commands=["predict"])
 def predict_command(message):
@@ -396,6 +402,7 @@ def predict_command(message):
     if len(parts) != 2:
         bot.reply_to(message, "Формат: /predict META")
         return
+
     ticker = parts[1].upper().strip()
     if ticker not in ALLOWED_TICKERS:
         bot.reply_to(message, f"Разрешены: {', '.join(sorted(ALLOWED_TICKERS))}")
@@ -407,12 +414,14 @@ def predict_command(message):
     except Exception as e:
         bot.reply_to(message, f"Ошибка: {e}")
 
+
 @bot.message_handler(commands=["predict7"])
 def predict7_command(message):
     parts = message.text.split()
     if len(parts) != 2:
         bot.reply_to(message, "Формат: /predict7 META")
         return
+
     ticker = parts[1].upper().strip()
     if ticker not in ALLOWED_TICKERS:
         bot.reply_to(message, f"Разрешены: {', '.join(sorted(ALLOWED_TICKERS))}")
@@ -435,7 +444,7 @@ def callback_handler(call):
             bot.send_message(
                 call.message.chat.id,
                 f"✅ Bot RUNNING\nSource: Yahoo Finance\nTickers: {', '.join(sorted(ALLOWED_TICKERS))}\n"
-                f"Forecast: 1D + 7D\nNews: yfinance headlines"
+                f"Mode: Predict 1D + Predict 7D\nNews: yfinance headlines"
             )
             return
 
@@ -444,6 +453,7 @@ def callback_handler(call):
             if ticker not in ALLOWED_TICKERS:
                 bot.send_message(call.message.chat.id, "Ticker not allowed.")
                 return
+
             text = do_predict_1d(ticker)
             bot.send_message(call.message.chat.id, text, parse_mode="Markdown")
             return
@@ -453,6 +463,7 @@ def callback_handler(call):
             if ticker not in ALLOWED_TICKERS:
                 bot.send_message(call.message.chat.id, "Ticker not allowed.")
                 return
+
             text = do_predict_7d(ticker)
             bot.send_message(call.message.chat.id, text, parse_mode="Markdown")
             return
