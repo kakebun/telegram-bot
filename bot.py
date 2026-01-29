@@ -5,7 +5,9 @@ from sklearn.linear_model import LinearRegression
 from datetime import datetime, timezone, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-API_TOKEN = "8581167136:AAGXLtfrd7NoOpW9arKFWkqUQtmauAhqjrc"
+import os
+API_TOKEN = os.getenv("BOT_TOKEN")
+
 bot = telebot.TeleBot(API_TOKEN)
 
 ALLOWED_TICKERS = {"META", "SNAP", "PINS"}
