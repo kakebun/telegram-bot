@@ -1,10 +1,13 @@
 # bot.py
 import os
 import time
+import re
 import telebot
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
+from bs4 import BeautifulSoup
 
 from sklearn.linear_model import LinearRegression
 from datetime import datetime, timezone, timedelta
@@ -14,7 +17,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # ======================
 # CONFIG
 # ======================
-API_TOKEN = os.getenv("BOT_TOKEN")  # Railway/Render -> Variables -> BOT_TOKEN
+API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Add it in Variables (BOT_TOKEN).")
 
@@ -25,62 +28,47 @@ ALLOWED_TICKERS = {"META", "SNAP", "PINS"}
 HISTORY_PERIOD = "6mo"
 INTERVAL = "1d"
 
-NEWS_LOOKBACK_DAYS = 7
-NEWS_LIMIT = 12
+# News settings
+NEWS_LOOKBACK_DAYS = 30
+NEWS_LIMIT = 10
 
-# cache (чтобы меньше дергать Yahoo)
-CACHE_TTL_SECONDS = 60
-_cache = {}  # key -> (ts, value)
+# Cache
+CACHE_TTL_SECONDS = 120
+_cache = {}
+
+# HTTP for excerpt
+HTTP_TIMEOUT = 8
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+}
 
 
 # ======================
-# NEWS RULES (простая "логика понимания" новостей)
+# NEWS RULES (event-based)
 # ======================
 NEWS_RULES = [
-    # Very positive
-    {
-        "keywords": [
-            "beats earnings", "earnings beat", "revenue beat",
-            "raised guidance", "guidance raised",
-            "upgrade", "price target raised"
-        ],
-        "score": +3,
-        "tag": "Strong positive"
-    },
-    {
-        "keywords": ["partnership", "deal", "contract", "acquisition", "buyback", "share repurchase"],
-        "score": +2,
-        "tag": "Positive catalyst"
-    },
-    {
-        "keywords": ["launch", "released", "new product", "record revenue", "strong demand"],
-        "score": +2,
-        "tag": "Growth signal"
-    },
+    {"keywords": ["beats earnings", "earnings beat", "revenue beat", "raised guidance", "guidance raised",
+                 "upgrade", "price target raised"], "score": +3, "tag": "Strong positive"},
+    {"keywords": ["partnership", "deal", "contract", "acquisition", "buyback", "share repurchase"],
+     "score": +2, "tag": "Positive catalyst"},
+    {"keywords": ["launch", "released", "new product", "record revenue", "strong demand"],
+     "score": +2, "tag": "Growth signal"},
 
-    # Neutral
     {"keywords": ["expects", "plans", "considering", "announced", "update"], "score": 0, "tag": "Neutral"},
 
-    # Negative
-    {
-        "keywords": [
-            "missed earnings", "earnings miss", "revenue miss",
-            "cut guidance", "guidance cut",
-            "downgrade", "price target cut"
-        ],
-        "score": -3,
-        "tag": "Strong negative"
-    },
-    {"keywords": ["lawsuit", "probe", "investigation", "regulators", "fine", "ban", "antitrust"], "score": -2,
-     "tag": "Legal/regulatory risk"},
-    {"keywords": ["weak demand", "slowdown", "warning", "decline", "fell", "drops"], "score": -2,
-     "tag": "Weakness signal"},
+    {"keywords": ["missed earnings", "earnings miss", "revenue miss", "cut guidance", "guidance cut",
+                 "downgrade", "price target cut"], "score": -3, "tag": "Strong negative"},
+    {"keywords": ["lawsuit", "probe", "investigation", "regulators", "fine", "ban", "antitrust"],
+     "score": -2, "tag": "Legal/regulatory risk"},
+    {"keywords": ["weak demand", "slowdown", "warning", "decline", "fell", "drops"],
+     "score": -2, "tag": "Weakness signal"},
     {"keywords": ["layoffs", "cuts jobs", "cost cutting"], "score": -1, "tag": "Cost-cutting (mixed)"},
 ]
 
 
 # ======================
-# HELPERS
+# CACHE HELPERS
 # ======================
 def cache_get(key: str):
     item = _cache.get(key)
@@ -92,13 +80,14 @@ def cache_get(key: str):
         return None
     return val
 
-
 def cache_set(key: str, val):
     _cache[key] = (time.time(), val)
 
 
+# ======================
+# TEXT HELPERS
+# ======================
 def sanitize_md(text: str) -> str:
-    # чтобы не ломать Telegram Markdown
     if not text:
         return ""
     return (text.replace("*", "")
@@ -107,12 +96,16 @@ def sanitize_md(text: str) -> str:
                 .replace("[", "(")
                 .replace("]", ")"))
 
+def shorten(text: str, n: int = 240) -> str:
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(text) <= n:
+        return text
+    return text[:n].rstrip() + "…"
 
 def parse_predict_command(text: str):
     """
     /predict META 1d
     /predict META 7d
-    returns: (ticker, mode) mode in {"1d","7d"} or (None,None)
     """
     parts = text.split()
     if len(parts) != 3:
@@ -142,7 +135,7 @@ def main_menu():
 
 
 # ======================
-# DATA FROM YAHOO FINANCE
+# PRICES
 # ======================
 def fetch_price_df(ticker: str) -> pd.DataFrame:
     cache_key = f"prices:{ticker}:{HISTORY_PERIOD}:{INTERVAL}"
@@ -152,42 +145,56 @@ def fetch_price_df(ticker: str) -> pd.DataFrame:
 
     df = yf.download(ticker, period=HISTORY_PERIOD, interval=INTERVAL, progress=False)
 
-    # иногда yfinance отдаёт MultiIndex
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
     if df is None or df.empty:
         raise ValueError("Yahoo Finance returned empty data (try later).")
-
     if "Close" not in df.columns:
         raise ValueError("Yahoo Finance data has no 'Close' column.")
 
     df = df.dropna(subset=["Close"]).copy()
-    if len(df) < 20:
-        raise ValueError("Not enough data from Yahoo Finance (need at least 20 days).")
+    if len(df) < 30:
+        raise ValueError("Not enough data (need at least 30 days).")
 
     cache_set(cache_key, df)
     return df
 
 
+def compute_rsi(series: pd.Series, period: int = 14) -> float:
+    """
+    RSI: выше ~70 перегрето, ниже ~30 перепродано (примерно)
+    """
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return float(rsi.iloc[-1])
+
+
+def compute_volatility(series: pd.Series, window: int = 14) -> float:
+    """
+    Волатильность как средняя абсолютная дневная доходность (%)
+    """
+    ret = series.pct_change().dropna()
+    vol = ret.abs().rolling(window).mean()
+    return float(vol.iloc[-1] * 100.0)
+
+
 # ======================
-# NEWS FROM YAHOO (via yfinance)
+# NEWS + EXCERPT
 # ======================
 def fetch_news_yahoo(ticker: str) -> list[dict]:
-    """
-    yfinance берет новости с Yahoo Finance и отдаёт:
-    title / publisher / link / providerPublishTime ...
-    """
-    cache_key = f"news:{ticker}"
+    cache_key = f"newslist:{ticker}"
     cached = cache_get(cache_key)
     if cached is not None:
         return cached
 
     t = yf.Ticker(ticker)
     try:
-        news = t.news  # чаще работает
+        news = t.news
     except Exception:
-        # на некоторых версиях
         try:
             news = t.get_news()
         except Exception:
@@ -200,21 +207,46 @@ def fetch_news_yahoo(ticker: str) -> list[dict]:
     return news
 
 
-def analyze_news_semantic(news: list[dict], lookback_days: int = 7, limit: int = 12):
-    """
-    "Изучение" новостей через правила:
-    - ищем ключевые слова и даем score новости
-    Возвращает:
-      avg_score (средняя оценка),
-      top_items (самые "влиятельные" по |score|),
-      used_count
-    """
-    cutoff = int(time.time()) - lookback_days * 24 * 3600
+def fetch_news_excerpt(url: str) -> str:
+    if not url:
+        return ""
+    cache_key = f"excerpt:{url}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
 
+    try:
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        if r.status_code >= 400:
+            cache_set(cache_key, "")
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        og = soup.find("meta", attrs={"property": "og:description"})
+        if og and og.get("content"):
+            excerpt = shorten(og.get("content", ""), 260)
+            cache_set(cache_key, excerpt)
+            return excerpt
+
+        desc = soup.find("meta", attrs={"name": "description"})
+        if desc and desc.get("content"):
+            excerpt = shorten(desc.get("content", ""), 260)
+            cache_set(cache_key, excerpt)
+            return excerpt
+    except Exception:
+        pass
+
+    cache_set(cache_key, "")
+    return ""
+
+
+def analyze_news(news: list[dict], lookback_days: int = 30, limit: int = 10):
+    cutoff = int(time.time()) - lookback_days * 24 * 3600
     items = []
+
     for n in news:
-        ts = n.get("providerPublishTime") or 0
-        if ts < cutoff:
+        ts = n.get("providerPublishTime")
+        if isinstance(ts, int) and ts < cutoff:
             continue
 
         raw_title = n.get("title") or ""
@@ -227,7 +259,6 @@ def analyze_news_semantic(news: list[dict], lookback_days: int = 7, limit: int =
 
         score = 0
         tags = []
-
         for rule in NEWS_RULES:
             for kw in rule["keywords"]:
                 if kw in title:
@@ -235,63 +266,31 @@ def analyze_news_semantic(news: list[dict], lookback_days: int = 7, limit: int =
                     tags.append(rule["tag"])
                     break
 
+        excerpt = fetch_news_excerpt(link)
+
         items.append({
             "title": raw_title,
             "publisher": publisher,
             "link": link,
-            "ts": ts,
+            "ts": ts if isinstance(ts, int) else 0,
             "score": int(score),
             "tags": list(dict.fromkeys(tags)),
+            "excerpt": excerpt
         })
 
-    # свежие сверху, режем limit
-    items.sort(key=lambda x: x["ts"], reverse=True)
+    items.sort(key=lambda x: x.get("ts", 0), reverse=True)
     items = items[:limit]
 
     if not items:
         return 0.0, [], 0
 
     avg_score = float(np.mean([x["score"] for x in items]))
-    top_items = sorted(items, key=lambda x: abs(x["score"]), reverse=True)[:5]
+    top_items = sorted(items, key=lambda x: abs(x["score"]), reverse=True)[:3]  # 3 новости достаточно
     return avg_score, top_items, len(items)
 
 
-def build_news_reasoning(avg_score: float, top_items: list[dict], used_count: int):
-    """
-    Возвращает (текст_новостей, news_bias)
-    news_bias: -1 / 0 / +1
-    """
-    if used_count == 0:
-        return "News analysis: *No recent news found (or Yahoo limit).*", 0
-
-    if avg_score >= 1.0:
-        bias = 1
-        head = f"News analysis: *Bullish* (avg `{avg_score:+.2f}` from {used_count} headlines)"
-    elif avg_score <= -1.0:
-        bias = -1
-        head = f"News analysis: *Bearish* (avg `{avg_score:+.2f}` from {used_count} headlines)"
-    else:
-        bias = 0
-        head = f"News analysis: *Mixed/Neutral* (avg `{avg_score:+.2f}` from {used_count} headlines)"
-
-    lines = [head, "", "*Most impactful headlines:*"]
-    for it in top_items:
-        title = sanitize_md(it["title"])
-        tags = ", ".join(it["tags"]) if it["tags"] else "Unclassified"
-        publisher = sanitize_md(it.get("publisher", ""))
-        link = it.get("link", "")
-
-        lines.append(
-            f"• `{it['score']:+d}` — {title} ({publisher})\n"
-            f"  Tags: {sanitize_md(tags)}\n"
-            f"  {link}"
-        )
-
-    return "\n".join(lines), bias
-
-
 # ======================
-# MODEL (Linear Regression) + PREDICT N DAYS
+# MODEL
 # ======================
 def predict_prices(ticker: str, days: int):
     df = fetch_price_df(ticker)
@@ -312,15 +311,113 @@ def predict_prices(ticker: str, days: int):
 
     last_price = float(y[-1][0])
 
-    # торговые дни (business days)
     last_date = close.index[-1]
     future_dates = pd.bdate_range(last_date + pd.Timedelta(days=1), periods=days).to_list()
 
-    return preds, last_price, r2, slope, future_dates
+    # дополнительные индикаторы
+    rsi = compute_rsi(close, 14)
+    vol = compute_volatility(close, 14)
+
+    return preds, last_price, r2, slope, future_dates, rsi, vol
 
 
 # ======================
-# TEXT FORMATTERS
+# LOGIC ENGINE (сопоставление факторов)
+# ======================
+def score_trend(slope: float) -> tuple[int, str]:
+    if slope > 0:
+        return 2, "Price trend is upward (positive slope)."
+    if slope < 0:
+        return -2, "Price trend is downward (negative slope)."
+    return 0, "Price trend is flat (slope ~ 0)."
+
+def score_rsi(rsi: float) -> tuple[int, str]:
+    # RSI > 70 often overbought (risk of pullback)
+    # RSI < 30 often oversold (possible bounce)
+    if rsi >= 70:
+        return -1, f"RSI is high ({rsi:.1f}) → market may be overbought (pullback risk)."
+    if rsi <= 30:
+        return +1, f"RSI is low ({rsi:.1f}) → market may be oversold (bounce potential)."
+    return 0, f"RSI is normal ({rsi:.1f}) → no strong signal."
+
+def score_vol(vol_pct: float) -> tuple[int, str]:
+    # просто логика: высокая волатильность = больше неопределенности
+    if vol_pct >= 3.0:
+        return 0, f"Volatility is high (~{vol_pct:.2f}% daily) → prediction uncertainty is higher."
+    return 0, f"Volatility is moderate (~{vol_pct:.2f}% daily)."
+
+def score_news(avg_score: float, used_count: int) -> tuple[int, str]:
+    if used_count == 0:
+        return 0, "No usable recent news → news factor is neutral."
+    if avg_score >= 1.0:
+        return +2, f"News looks bullish (avg score {avg_score:+.2f})."
+    if avg_score <= -1.0:
+        return -2, f"News looks bearish (avg score {avg_score:+.2f})."
+    return 0, f"News is mixed/neutral (avg score {avg_score:+.2f})."
+
+
+def build_news_excerpts(top_items: list[dict]) -> str:
+    if not top_items:
+        return "News excerpts: none."
+    lines = ["*Key news excerpts:*"]
+    for it in top_items:
+        title = sanitize_md(it["title"])
+        excerpt = sanitize_md(it.get("excerpt") or "")
+        link = it.get("link", "")
+        tags = ", ".join(it["tags"]) if it["tags"] else "Unclassified"
+
+        # короткая фраза влияния по score новости
+        if it["score"] >= 2:
+            impact = "Possible positive catalyst → can support growth."
+        elif it["score"] <= -2:
+            impact = "Possible negative catalyst → can pressure price down."
+        else:
+            impact = "Likely weak/neutral impact."
+
+        lines.append(f"• {title}")
+        lines.append(f"  Tags: {sanitize_md(tags)}")
+        if excerpt:
+            lines.append(f"  Excerpt: _{shorten(excerpt, 220)}_")
+        lines.append(f"  {impact}")
+        if link:
+            lines.append(f"  {link}")
+    return "\n".join(lines)
+
+
+def logical_conclusion(total_score: int) -> str:
+    if total_score >= 3:
+        return "✅ Conclusion: *Bullish bias* (more factors support growth)."
+    if total_score <= -3:
+        return "✅ Conclusion: *Bearish bias* (more factors support decline)."
+    return "✅ Conclusion: *Mixed/uncertain* (signals conflict or are weak)."
+
+
+def build_explanation(slope: float, rsi: float, vol_pct: float, avg_news: float, used_news: int, news_excerpts: str):
+    t_score, t_txt = score_trend(slope)
+    r_score, r_txt = score_rsi(rsi)
+    v_score, v_txt = score_vol(vol_pct)
+    n_score, n_txt = score_news(avg_news, used_news)
+
+    total = t_score + r_score + v_score + n_score
+
+    # почему так
+    reason_lines = [
+        "🧠 *Logical reasoning (factors):*",
+        f"• Trend factor: {t_txt} (score {t_score:+d})",
+        f"• RSI factor: {r_txt} (score {r_score:+d})",
+        f"• Volatility factor: {v_txt} (score {v_score:+d})",
+        f"• News factor: {n_txt} (score {n_score:+d})",
+        "",
+        logical_conclusion(total),
+        "",
+        news_excerpts
+    ]
+
+    return "\n".join(reason_lines), total
+
+
+# ======================
+# OUTPUT
 # ======================
 def build_predict_text(ticker: str, mode: str, preds: list[float], last_price: float, r2: float,
                       future_dates: list, explanation: str) -> str:
@@ -329,64 +426,35 @@ def build_predict_text(ticker: str, mode: str, preds: list[float], last_price: f
     if mode == "1d":
         predicted = preds[0]
         direction = "📈 UP" if predicted > last_price else "📉 DOWN"
+        delta = predicted - last_price
         return (
             f"*{ticker} Predict (1D)*\n\n"
             f"Last close: `{last_price:.2f}`\n"
             f"Predicted next close: `{predicted:.2f}`\n"
+            f"Move (approx): `{delta:+.2f}`\n"
             f"Direction: {direction}\n"
             f"Confidence (R²): `{r2*100:.1f}%`\n\n"
             f"{explanation}\n\n"
             f"⏱ {kz_time.strftime('%Y-%m-%d %H:%M')}"
         )
 
-    # 7d
-    day7 = preds[-1]
-    direction = "📈 UP" if day7 > last_price else "📉 DOWN"
+    dayN = preds[-1]
+    direction = "📈 UP" if dayN > last_price else "📉 DOWN"
+    delta7 = dayN - last_price
+
     lines = [f"• {d.strftime('%Y-%m-%d')}: `{p:.2f}`" for d, p in zip(future_dates, preds)]
     predict_block = "\n".join(lines)
 
     return (
         f"*{ticker} Predict (7D)*\n\n"
         f"Last close: `{last_price:.2f}`\n"
-        f"Day 7 prediction: `{day7:.2f}`\n"
+        f"Day 7 prediction: `{dayN:.2f}`\n"
+        f"Move (approx): `{delta7:+.2f}`\n"
         f"Direction (vs last): {direction}\n"
         f"Confidence (R²): `{r2*100:.1f}%`\n\n"
-        f"*Next 7 predicted closes:*\n{predict_block}\n\n"
+        f"*Next predicted closes:*\n{predict_block}\n\n"
         f"{explanation}\n\n"
         f"⏱ {kz_time.strftime('%Y-%m-%d %H:%M')}"
-    )
-
-
-def build_combined_explanation(slope: float, news_block: str, news_bias: int) -> str:
-    # тренд
-    if slope > 0:
-        trend_bias = 1
-        trend_txt = f"Trend: *Uptrend* (slope `{slope:+.4f}`)"
-    elif slope < 0:
-        trend_bias = -1
-        trend_txt = f"Trend: *Downtrend* (slope `{slope:+.4f}`)"
-    else:
-        trend_bias = 0
-        trend_txt = f"Trend: *Flat* (slope `{slope:+.4f}`)"
-
-    combined = trend_bias + news_bias
-
-    if combined >= 2:
-        final = "Overall: uptrend + bullish news → *higher probability of growth*."
-    elif combined <= -2:
-        final = "Overall: downtrend + bearish news → *higher probability of decline*."
-    elif combined == 1:
-        final = "Overall: signals slightly positive → *mild bullish bias*."
-    elif combined == -1:
-        final = "Overall: signals slightly negative → *mild bearish bias*."
-    else:
-        final = "Overall: weak/conflicting signals → *uncertain / sideways risk*."
-
-    return (
-        "📊 *Why it may move?*\n"
-        f"• {trend_txt}\n"
-        f"• {final}\n\n"
-        f"{news_block}"
     )
 
 
@@ -400,20 +468,24 @@ def usage_text() -> str:
 
 
 # ======================
-# CORE ACTION
+# CORE
 # ======================
 def do_predict(ticker: str, mode: str) -> str:
     days = 1 if mode == "1d" else 7
-
-    preds, last_price, r2, slope, future_dates = predict_prices(ticker, days=days)
+    preds, last_price, r2, slope, future_dates, rsi, vol_pct = predict_prices(ticker, days=days)
 
     news = fetch_news_yahoo(ticker)
-    avg_score, top_items, used_count = analyze_news_semantic(
-        news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT
-    )
-    news_block, news_bias = build_news_reasoning(avg_score, top_items, used_count)
+    avg_score, top_items, used_count = analyze_news(news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT)
+    news_excerpts = build_news_excerpts(top_items)
 
-    explanation = build_combined_explanation(slope, news_block, news_bias)
+    explanation, _total_score = build_explanation(
+        slope=slope,
+        rsi=rsi,
+        vol_pct=vol_pct,
+        avg_news=avg_score,
+        used_news=used_count,
+        news_excerpts=news_excerpts
+    )
 
     return build_predict_text(ticker, mode, preds, last_price, r2, future_dates, explanation)
 
@@ -426,14 +498,13 @@ def start(message):
     bot.send_message(
         message.chat.id,
         "👋 *Hello!*\n\n"
-        "You are using *Predict AI*.\n\n"
-        "📌 Commands:\n"
+        "This bot predicts stocks using:\n"
+        "• Yahoo Finance prices (trend)\n"
+        "• RSI + volatility\n"
+        "• Yahoo Finance news + short excerpts\n\n"
+        "Commands:\n"
         "• `/predict META 1d`\n"
         "• `/predict META 7d`\n\n"
-        "📌 It uses:\n"
-        "• Yahoo Finance prices\n"
-        "• Yahoo Finance news (via yfinance)\n"
-        "• Trend + news keyword scoring\n\n"
         "⚠️ Not financial advice.",
         reply_markup=main_menu(),
         parse_mode="Markdown"
@@ -508,5 +579,5 @@ def callback_handler(call):
 # RUN
 # ======================
 if __name__ == "__main__":
-    print("Bot started ✅ (Yahoo prices + Yahoo news + news scoring enabled)")
+    print("Bot started ✅ (logic engine + news excerpts enabled)")
     bot.infinity_polling()
