@@ -10,7 +10,6 @@ import yfinance as yf
 import requests
 from bs4 import BeautifulSoup
 
-from sklearn.linear_model import LinearRegression
 from datetime import datetime, timezone, timedelta
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -32,6 +31,10 @@ INTERVAL = "1d"
 # News settings
 NEWS_LOOKBACK_DAYS = 30
 NEWS_LIMIT = 10
+
+# Returns model settings (fixes unrealistic jumps)
+RETURNS_WINDOW_DAYS = 60      # use last ~60 trading days of returns
+CLAMP_SIGMA_MULT = 2.0        # max daily move = 2*sigma
 
 # Cache
 CACHE_TTL_SECONDS = 120
@@ -158,8 +161,8 @@ def fetch_price_df(ticker: str) -> pd.DataFrame:
         raise ValueError("Yahoo Finance data has no 'Close' column.")
 
     df = df.dropna(subset=["Close"]).copy()
-    if len(df) < 30:
-        raise ValueError("Not enough data (need at least 30 days).")
+    if len(df) < 40:
+        raise ValueError("Not enough data (need at least 40 trading days).")
 
     cache_set(cache_key, df)
     return df
@@ -290,45 +293,69 @@ def analyze_news(news: list[dict], lookback_days: int = 30, limit: int = 10):
 
 
 # ======================
-# MODEL
+# RETURNS-BASED PREDICTOR (FIXED)
 # ======================
 def predict_prices(ticker: str, days: int):
+    """
+    Predicts future prices using recent daily returns (NOT direct price line).
+    This avoids unrealistic jumps like 739 -> 617 in one day.
+    """
     df = fetch_price_df(ticker)
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
 
-    y = close.values.reshape(-1, 1)
-    X = np.arange(len(y)).reshape(-1, 1)
+    returns = close.pct_change().dropna()
+    if len(returns) < 20:
+        raise ValueError("Not enough returns data.")
 
-    model = LinearRegression()
-    model.fit(X, y)
+    window = min(RETURNS_WINDOW_DAYS, len(returns))
+    r = returns.iloc[-window:]
 
-    r2 = float(model.score(X, y))
-    slope = float(model.coef_[0][0])
+    mu = float(r.mean())       # mean daily return
+    sigma = float(r.std())     # daily volatility (std)
+    if not np.isfinite(sigma) or sigma <= 0:
+        sigma = 0.01
 
-    start = len(y)
-    future_X = np.arange(start, start + days).reshape(-1, 1)
-    preds = model.predict(future_X).reshape(-1).astype(float).tolist()
+    last_price = float(close.iloc[-1])
 
-    last_price = float(y[-1][0])
+    # Clamp daily step to +/- (CLAMP_SIGMA_MULT*sigma)
+    max_step = CLAMP_SIGMA_MULT * sigma
 
+    preds = []
+    cur = last_price
+    for _ in range(days):
+        step = mu
+        step = max(-max_step, min(max_step, step))  # clamp
+        cur = cur * (1.0 + step)
+        preds.append(float(cur))
+
+    # Dates
     last_date = close.index[-1]
     future_dates = pd.bdate_range(last_date + pd.Timedelta(days=1), periods=days).to_list()
 
+    # Indicators for explanation
     rsi = compute_rsi(close, 14)
-    vol = compute_volatility(close, 14)
+    vol_pct = compute_volatility(close, 14)
 
-    return preds, last_price, r2, slope, future_dates, rsi, vol
+    # "Confidence" as stability score: lower sigma -> higher confidence
+    # map roughly to 0..1
+    stability = float(max(0.0, min(1.0, 1.0 - (sigma * 10.0))))
+
+    # Use "drift" for trend explanation
+    drift = mu
+
+    return preds, last_price, stability, drift, future_dates, rsi, vol_pct
 
 
 # ======================
 # LOGIC ENGINE
 # ======================
-def score_trend(slope: float) -> tuple[int, str]:
-    if slope > 0:
-        return 2, "Price trend is upward (positive slope)."
-    if slope < 0:
-        return -2, "Price trend is downward (negative slope)."
-    return 0, "Price trend is flat (slope ~ 0)."
+def score_trend(drift: float) -> tuple[int, str]:
+    # drift = mean daily return
+    if drift > 0:
+        return 2, f"Average daily return is positive ({drift*100:.2f}%) → upward bias."
+    if drift < 0:
+        return -2, f"Average daily return is negative ({drift*100:.2f}%) → downward bias."
+    return 0, "Average daily return is near zero → no clear trend."
 
 
 def score_rsi(rsi: float) -> tuple[int, str]:
@@ -356,11 +383,8 @@ def score_news(avg_score: float, used_count: int) -> tuple[int, str]:
 
 
 def build_news_excerpts(top_items: list[dict]) -> str:
-    """
-    Если новостей нет — вернем пустую строку (чтобы ничего не печаталось).
-    """
     if not top_items:
-        return ""
+        return ""  # IMPORTANT: don't show "none"
 
     lines = ["*Key news excerpts:*"]
     for it in top_items:
@@ -395,16 +419,16 @@ def logical_conclusion(total_score: int) -> str:
     return "✅ Conclusion: *Mixed / uncertain* (signals conflict or are weak)."
 
 
-def build_explanation(slope: float, rsi: float, vol_pct: float,
+def build_explanation(drift: float, rsi: float, vol_pct: float,
                       avg_news: float, used_news: int, news_excerpts: str) -> str:
-    t_score, t_txt = score_trend(slope)
+    t_score, t_txt = score_trend(drift)
     r_score, r_txt = score_rsi(rsi)
     v_score, v_txt = score_vol(vol_pct)
     n_score, n_txt = score_news(avg_news, used_news)
 
     total = t_score + r_score + v_score + n_score
 
-    reason_lines = [
+    lines = [
         "🧠 *Logical reasoning (factors):*",
         f"• Trend factor: {t_txt} (score {t_score:+d})",
         f"• RSI factor: {r_txt} (score {r_score:+d})",
@@ -414,17 +438,16 @@ def build_explanation(slope: float, rsi: float, vol_pct: float,
         logical_conclusion(total),
     ]
 
-    # добавляем блок новостей ТОЛЬКО если есть что показать
     if news_excerpts.strip():
-        reason_lines.extend(["", news_excerpts])
+        lines.extend(["", news_excerpts])
 
-    return "\n".join(reason_lines)
+    return "\n".join(lines)
 
 
 # ======================
 # OUTPUT
 # ======================
-def build_predict_text(ticker: str, mode: str, preds: list[float], last_price: float, r2: float,
+def build_predict_text(ticker: str, mode: str, preds: list[float], last_price: float, stability: float,
                       future_dates: list, explanation: str) -> str:
     kz_time = datetime.now(timezone.utc) + timedelta(hours=5)
 
@@ -438,26 +461,26 @@ def build_predict_text(ticker: str, mode: str, preds: list[float], last_price: f
             f"Predicted next close: `{predicted:.2f}`\n"
             f"Move (approx): `{delta:+.2f}`\n"
             f"Direction: {direction}\n"
-            f"Confidence (R²): `{r2*100:.1f}%`\n\n"
+            f"Stability score: `{stability*100:.1f}%`\n\n"
             f"{explanation}\n\n"
             f"⏱ {kz_time.strftime('%Y-%m-%d %H:%M')}"
         )
 
     dayN = preds[-1]
     direction = "📈 UP" if dayN > last_price else "📉 DOWN"
-    delta7 = dayN - last_price
+    deltaN = dayN - last_price
 
-    lines = [f"• {d.strftime('%Y-%m-%d')}: `{p:.2f}`" for d, p in zip(future_dates, preds)]
-    predict_block = "\n".join(lines)
+    rows = [f"• {d.strftime('%Y-%m-%d')}: `{p:.2f}`" for d, p in zip(future_dates, preds)]
+    path = "\n".join(rows)
 
     return (
         f"*{ticker} Predict (7D)*\n\n"
         f"Last close: `{last_price:.2f}`\n"
         f"Day 7 prediction: `{dayN:.2f}`\n"
-        f"Move (approx): `{delta7:+.2f}`\n"
+        f"Move (approx): `{deltaN:+.2f}`\n"
         f"Direction (vs last): {direction}\n"
-        f"Confidence (R²): `{r2*100:.1f}%`\n\n"
-        f"*Next predicted closes:*\n{predict_block}\n\n"
+        f"Stability score: `{stability*100:.1f}%`\n\n"
+        f"*Next predicted closes:*\n{path}\n\n"
         f"{explanation}\n\n"
         f"⏱ {kz_time.strftime('%Y-%m-%d %H:%M')}"
     )
@@ -477,14 +500,14 @@ def usage_text() -> str:
 # ======================
 def do_predict(ticker: str, mode: str) -> str:
     days = 1 if mode == "1d" else 7
-    preds, last_price, r2, slope, future_dates, rsi, vol_pct = predict_prices(ticker, days=days)
+    preds, last_price, stability, drift, future_dates, rsi, vol_pct = predict_prices(ticker, days=days)
 
     news = fetch_news_yahoo(ticker)
     avg_score, top_items, used_count = analyze_news(news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT)
     news_excerpts = build_news_excerpts(top_items)
 
     explanation = build_explanation(
-        slope=slope,
+        drift=drift,
         rsi=rsi,
         vol_pct=vol_pct,
         avg_news=avg_score,
@@ -492,7 +515,7 @@ def do_predict(ticker: str, mode: str) -> str:
         news_excerpts=news_excerpts
     )
 
-    return build_predict_text(ticker, mode, preds, last_price, r2, future_dates, explanation)
+    return build_predict_text(ticker, mode, preds, last_price, stability, future_dates, explanation)
 
 
 # ======================
@@ -510,10 +533,11 @@ def start(message):
         "Always do your own research and consult professional advisors.\n\n"
         "----------------------------------\n\n"
         "👋 *Welcome to Predict AI*\n\n"
-        "This bot analyzes:\n"
-        "• Historical price trends (Yahoo Finance)\n"
+        "This bot uses:\n"
+        "• Historical prices (Yahoo Finance)\n"
+        "• Returns-based forecasting (more realistic step-by-step path)\n"
         "• Technical indicators (RSI, volatility)\n"
-        "• Recent news headlines and short excerpts\n\n"
+        "• Yahoo Finance news + short excerpts\n\n"
         "*Commands:*\n"
         "• `/predict META 1d`\n"
         "• `/predict META 7d`\n\n"
@@ -592,5 +616,5 @@ def callback_handler(call):
 # RUN
 # ======================
 if __name__ == "__main__":
-    print("Bot started ✅ (logic engine + news excerpts enabled)")
+    print("Bot started ✅ (returns-based predictor + logic + news excerpts)")
     bot.infinity_polling()
