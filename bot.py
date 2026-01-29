@@ -2,6 +2,7 @@
 import os
 import time
 import re
+
 import telebot
 import pandas as pd
 import numpy as np
@@ -80,6 +81,7 @@ def cache_get(key: str):
         return None
     return val
 
+
 def cache_set(key: str, val):
     _cache[key] = (time.time(), val)
 
@@ -96,11 +98,13 @@ def sanitize_md(text: str) -> str:
                 .replace("[", "(")
                 .replace("]", ")"))
 
+
 def shorten(text: str, n: int = 240) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
     if len(text) <= n:
         return text
     return text[:n].rstrip() + "…"
+
 
 def parse_predict_command(text: str):
     """
@@ -162,9 +166,6 @@ def fetch_price_df(ticker: str) -> pd.DataFrame:
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> float:
-    """
-    RSI: выше ~70 перегрето, ниже ~30 перепродано (примерно)
-    """
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
@@ -174,9 +175,6 @@ def compute_rsi(series: pd.Series, period: int = 14) -> float:
 
 
 def compute_volatility(series: pd.Series, window: int = 14) -> float:
-    """
-    Волатильность как средняя абсолютная дневная доходность (%)
-    """
     ret = series.pct_change().dropna()
     vol = ret.abs().rolling(window).mean()
     return float(vol.iloc[-1] * 100.0)
@@ -220,6 +218,7 @@ def fetch_news_excerpt(url: str) -> str:
         if r.status_code >= 400:
             cache_set(cache_key, "")
             return ""
+
         soup = BeautifulSoup(r.text, "html.parser")
 
         og = soup.find("meta", attrs={"property": "og:description"})
@@ -233,6 +232,7 @@ def fetch_news_excerpt(url: str) -> str:
             excerpt = shorten(desc.get("content", ""), 260)
             cache_set(cache_key, excerpt)
             return excerpt
+
     except Exception:
         pass
 
@@ -285,7 +285,7 @@ def analyze_news(news: list[dict], lookback_days: int = 30, limit: int = 10):
         return 0.0, [], 0
 
     avg_score = float(np.mean([x["score"] for x in items]))
-    top_items = sorted(items, key=lambda x: abs(x["score"]), reverse=True)[:3]  # 3 новости достаточно
+    top_items = sorted(items, key=lambda x: abs(x["score"]), reverse=True)[:3]
     return avg_score, top_items, len(items)
 
 
@@ -314,7 +314,6 @@ def predict_prices(ticker: str, days: int):
     last_date = close.index[-1]
     future_dates = pd.bdate_range(last_date + pd.Timedelta(days=1), periods=days).to_list()
 
-    # дополнительные индикаторы
     rsi = compute_rsi(close, 14)
     vol = compute_volatility(close, 14)
 
@@ -322,7 +321,7 @@ def predict_prices(ticker: str, days: int):
 
 
 # ======================
-# LOGIC ENGINE (сопоставление факторов)
+# LOGIC ENGINE
 # ======================
 def score_trend(slope: float) -> tuple[int, str]:
     if slope > 0:
@@ -331,24 +330,24 @@ def score_trend(slope: float) -> tuple[int, str]:
         return -2, "Price trend is downward (negative slope)."
     return 0, "Price trend is flat (slope ~ 0)."
 
+
 def score_rsi(rsi: float) -> tuple[int, str]:
-    # RSI > 70 often overbought (risk of pullback)
-    # RSI < 30 often oversold (possible bounce)
     if rsi >= 70:
-        return -1, f"RSI is high ({rsi:.1f}) → market may be overbought (pullback risk)."
+        return -1, f"RSI is high ({rsi:.1f}) → overbought (pullback risk)."
     if rsi <= 30:
-        return +1, f"RSI is low ({rsi:.1f}) → market may be oversold (bounce potential)."
-    return 0, f"RSI is normal ({rsi:.1f}) → no strong signal."
+        return +1, f"RSI is low ({rsi:.1f}) → oversold (bounce potential)."
+    return 0, f"RSI is normal ({rsi:.1f}) → neutral."
+
 
 def score_vol(vol_pct: float) -> tuple[int, str]:
-    # просто логика: высокая волатильность = больше неопределенности
     if vol_pct >= 3.0:
-        return 0, f"Volatility is high (~{vol_pct:.2f}% daily) → prediction uncertainty is higher."
+        return 0, f"Volatility is high (~{vol_pct:.2f}% daily) → higher uncertainty."
     return 0, f"Volatility is moderate (~{vol_pct:.2f}% daily)."
+
 
 def score_news(avg_score: float, used_count: int) -> tuple[int, str]:
     if used_count == 0:
-        return 0, "No usable recent news → news factor is neutral."
+        return 0, "No usable recent news → neutral."
     if avg_score >= 1.0:
         return +2, f"News looks bullish (avg score {avg_score:+.2f})."
     if avg_score <= -1.0:
@@ -357,8 +356,12 @@ def score_news(avg_score: float, used_count: int) -> tuple[int, str]:
 
 
 def build_news_excerpts(top_items: list[dict]) -> str:
+    """
+    Если новостей нет — вернем пустую строку (чтобы ничего не печаталось).
+    """
     if not top_items:
-        return "News excerpts: none."
+        return ""
+
     lines = ["*Key news excerpts:*"]
     for it in top_items:
         title = sanitize_md(it["title"])
@@ -366,7 +369,6 @@ def build_news_excerpts(top_items: list[dict]) -> str:
         link = it.get("link", "")
         tags = ", ".join(it["tags"]) if it["tags"] else "Unclassified"
 
-        # короткая фраза влияния по score новости
         if it["score"] >= 2:
             impact = "Possible positive catalyst → can support growth."
         elif it["score"] <= -2:
@@ -381,6 +383,7 @@ def build_news_excerpts(top_items: list[dict]) -> str:
         lines.append(f"  {impact}")
         if link:
             lines.append(f"  {link}")
+
     return "\n".join(lines)
 
 
@@ -389,10 +392,11 @@ def logical_conclusion(total_score: int) -> str:
         return "✅ Conclusion: *Bullish bias* (more factors support growth)."
     if total_score <= -3:
         return "✅ Conclusion: *Bearish bias* (more factors support decline)."
-    return "✅ Conclusion: *Mixed/uncertain* (signals conflict or are weak)."
+    return "✅ Conclusion: *Mixed / uncertain* (signals conflict or are weak)."
 
 
-def build_explanation(slope: float, rsi: float, vol_pct: float, avg_news: float, used_news: int, news_excerpts: str):
+def build_explanation(slope: float, rsi: float, vol_pct: float,
+                      avg_news: float, used_news: int, news_excerpts: str) -> str:
     t_score, t_txt = score_trend(slope)
     r_score, r_txt = score_rsi(rsi)
     v_score, v_txt = score_vol(vol_pct)
@@ -400,7 +404,6 @@ def build_explanation(slope: float, rsi: float, vol_pct: float, avg_news: float,
 
     total = t_score + r_score + v_score + n_score
 
-    # почему так
     reason_lines = [
         "🧠 *Logical reasoning (factors):*",
         f"• Trend factor: {t_txt} (score {t_score:+d})",
@@ -409,11 +412,13 @@ def build_explanation(slope: float, rsi: float, vol_pct: float, avg_news: float,
         f"• News factor: {n_txt} (score {n_score:+d})",
         "",
         logical_conclusion(total),
-        "",
-        news_excerpts
     ]
 
-    return "\n".join(reason_lines), total
+    # добавляем блок новостей ТОЛЬКО если есть что показать
+    if news_excerpts.strip():
+        reason_lines.extend(["", news_excerpts])
+
+    return "\n".join(reason_lines)
 
 
 # ======================
@@ -478,7 +483,7 @@ def do_predict(ticker: str, mode: str) -> str:
     avg_score, top_items, used_count = analyze_news(news, lookback_days=NEWS_LOOKBACK_DAYS, limit=NEWS_LIMIT)
     news_excerpts = build_news_excerpts(top_items)
 
-    explanation, _total_score = build_explanation(
+    explanation = build_explanation(
         slope=slope,
         rsi=rsi,
         vol_pct=vol_pct,
@@ -497,15 +502,22 @@ def do_predict(ticker: str, mode: str) -> str:
 def start(message):
     bot.send_message(
         message.chat.id,
-        "👋 *Hello!*\n\n"
-        "This bot predicts stocks using:\n"
-        "• Yahoo Finance prices (trend)\n"
-        "• RSI + volatility\n"
-        "• Yahoo Finance news + short excerpts\n\n"
-        "Commands:\n"
+        "**⚠️ DISCLAIMER ⚠️**\n\n"
+        "**THIS BOT IS CREATED FOR EXPERIMENTAL AND EDUCATIONAL PURPOSES ONLY.**\n"
+        "**IT DOES NOT PROVIDE FINANCIAL ADVICE.**\n"
+        "**DO NOT MAKE INVESTMENT DECISIONS BASED SOLELY ON THIS BOT.**\n\n"
+        "Market predictions are uncertain and may be inaccurate.\n"
+        "Always do your own research and consult professional advisors.\n\n"
+        "----------------------------------\n\n"
+        "👋 *Welcome to Predict AI*\n\n"
+        "This bot analyzes:\n"
+        "• Historical price trends (Yahoo Finance)\n"
+        "• Technical indicators (RSI, volatility)\n"
+        "• Recent news headlines and short excerpts\n\n"
+        "*Commands:*\n"
         "• `/predict META 1d`\n"
         "• `/predict META 7d`\n\n"
-        "⚠️ Not financial advice.",
+        "Type `/status` to check bot status.",
         reply_markup=main_menu(),
         parse_mode="Markdown"
     )
@@ -516,7 +528,8 @@ def status(message):
     bot.reply_to(
         message,
         f"✅ Bot RUNNING\nSource: Yahoo Finance\nTickers: {', '.join(sorted(ALLOWED_TICKERS))}\n"
-        "Command: /predict <TICKER> <1d|7d>"
+        "Command: /predict <TICKER> <1d|7d>\n"
+        f"News lookback: {NEWS_LOOKBACK_DAYS} days"
     )
 
 
@@ -540,7 +553,7 @@ def predict_command(message):
         text = do_predict(ticker, mode)
         bot.send_message(message.chat.id, text, parse_mode="Markdown")
     except Exception as e:
-        bot.send_message(message.chat.id, f"Ошибка: {e}")
+        bot.send_message(message.chat.id, f"Error: {e}")
 
 
 # ======================
@@ -553,12 +566,12 @@ def callback_handler(call):
             bot.send_message(
                 call.message.chat.id,
                 f"✅ Bot RUNNING\nSource: Yahoo Finance\nTickers: {', '.join(sorted(ALLOWED_TICKERS))}\n"
-                "Command: /predict <TICKER> <1d|7d>"
+                "Command: /predict <TICKER> <1d|7d>\n"
+                f"News lookback: {NEWS_LOOKBACK_DAYS} days"
             )
             return
 
         if call.data.startswith("predict_"):
-            # predict_META_1d
             _, ticker, mode = call.data.split("_", 2)
             ticker = ticker.upper()
             mode = mode.lower()
@@ -572,7 +585,7 @@ def callback_handler(call):
             return
 
     except Exception as e:
-        bot.send_message(call.message.chat.id, f"Ошибка: {e}")
+        bot.send_message(call.message.chat.id, f"Error: {e}")
 
 
 # ======================
