@@ -21,7 +21,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # chat_id -> {"src": "EN", "dst": "KZ"}
 users = {}
 
-# ===== UI =====
+# ===== Translation directions =====
 DIRS = [
     ("EN", "KZ"),
     ("KZ", "EN"),
@@ -61,8 +61,8 @@ def is_thanks(text: str) -> bool:
     keys = ["рақмет", "рахмет", "спасибо", "thank", "thx"]
     return any(k in t for k in keys)
 
+# ===== OpenAI calls =====
 def assistant_reply_kz(user_text: str) -> str:
-    # No markdown, no lists, short answers, no "explain the phrase" unless asked
     system = (
         "Sen qazaq tilinde jauap beretin AI-komekshisinsin. "
         "Jauap qysqa jane naqty bolsyn (1-3 jūyeler). "
@@ -113,6 +113,22 @@ def start(msg):
     )
     bot.send_message(chat_id, text, reply_markup=dir_menu("EN", "KZ"))
 
+@bot.message_handler(commands=["тiл"])
+def choose_language(msg):
+    chat_id = msg.chat.id
+    if chat_id not in users:
+        users[chat_id] = {"src": "EN", "dst": "KZ"}
+
+    src = users[chat_id]["src"]
+    dst = users[chat_id]["dst"]
+
+    bot.send_message(
+        chat_id,
+        "🌍 Аударма бағытын таңдаңыз (қай тілден → қай тілге):",
+        reply_markup=dir_menu(src, dst)
+    )
+
+# ===== Callback buttons =====
 @bot.callback_query_handler(func=lambda c: True)
 def callbacks(call):
     chat_id = call.message.chat.id
@@ -125,31 +141,30 @@ def callbacks(call):
         _, src, dst = data.split("_", 2)
         users[chat_id]["src"] = src
         users[chat_id]["dst"] = dst
+
         bot.answer_callback_query(call.id, f"Таңдалды: {src} → {dst}")
-        bot.send_message(
-            chat_id,
-            f"✅ Жақсы! Қазір бағыт: {src} → {dst}\n✍️ Аудару үшін: аудар ... деп жазыңыз.",
-            reply_markup=dir_menu(src, dst)
-        )
+
+        # After choosing language: confirm WITHOUT menu spam
+        bot.send_message(chat_id, f"✅ Жақсы! Қазір бағыт: {src} → {dst}\n✍️ Аудару үшін: аудар ... деп жазыңыз.")
         return
 
     if data == "HELP":
         src = users[chat_id]["src"]
         dst = users[chat_id]["dst"]
         bot.answer_callback_query(call.id)
+
         bot.send_message(
             chat_id,
-            "ℹ️ Қолдану:\n"
-            "1) Кәдімгі сұрақ қойсаңыз — мен қазақша қысқа жауап беремін.\n"
-            "2) Аудару керек болса — 'аудар' деп бастап, мәтінді жазыңыз.\n"
-            f"📌 Қазіргі бағыт: {src} → {dst}",
-            reply_markup=dir_menu(src, dst)
+            "ℹ️ Көмек:\n"
+            "• Тілді өзгерту үшін: /тiл\n"
+            "• Аудару үшін: аудар + мәтін\n"
+            f"Қазіргі бағыт: {src} → {dst}"
         )
         return
 
     bot.answer_callback_query(call.id, "OK")
 
-# ===== Main handler =====
+# ===== Main messages =====
 @bot.message_handler(content_types=["text"])
 def handle_text(msg):
     chat_id = msg.chat.id
@@ -166,28 +181,24 @@ def handle_text(msg):
     try:
         bot.send_chat_action(chat_id, "typing")
 
-        # thanks -> fixed reply (no extra questions)
+        # thanks -> fixed reply
         if is_thanks(text) and "аудар" not in text.lower():
-            bot.send_message(chat_id, "Әрқашан көмектесуге дайынмын 😊", reply_markup=dir_menu(src, dst))
+            bot.send_message(chat_id, "Әрқашан көмектесуге дайынмын 😊")
             return
 
-        # translation when "аудар" used
+        # translation only when "аудар"
         payload = parse_audar_command(text)
         if payload:
             translated = translate_text(payload, src, dst)
-            bot.send_message(
-                chat_id,
-                f"✅ Міне, сіздің аудармаңыз ({src} → {dst}):\n{translated}",
-                reply_markup=dir_menu(src, dst)
-            )
+            bot.send_message(chat_id, f"✅ Міне, сіздің аудармаңыз ({src} → {dst}):\n{translated}")
             return
 
         # normal assistant reply
         answer = assistant_reply_kz(text)
-        bot.send_message(chat_id, answer, reply_markup=dir_menu(src, dst))
+        bot.send_message(chat_id, answer)
 
     except Exception as e:
-        bot.send_message(chat_id, f"⚠️ Қате: {e}", reply_markup=dir_menu(src, dst))
+        bot.send_message(chat_id, f"⚠️ Қате: {e}")
 
 if __name__ == "__main__":
     print("Bot is running...")
