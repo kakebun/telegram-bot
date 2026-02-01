@@ -38,7 +38,7 @@ def dir_menu(current_src="EN", current_dst="KZ"):
         if src == current_src and dst == current_dst:
             label = "✅ " + label
         kb.add(InlineKeyboardButton(label, callback_data=f"DIR_{src}_{dst}"))
-    kb.add(InlineKeyboardButton("Көмек", callback_data="HELP"))
+    kb.add(InlineKeyboardButton("ℹ️ Көмек", callback_data="HELP"))
     return kb
 
 # ===== Helpers =====
@@ -102,14 +102,14 @@ def start(msg):
     users[chat_id] = {"src": "EN", "dst": "KZ"}
 
     text = (
-        "ЕСКЕРТУ (DISCLAIMER):\n"
+        "⚠️ ЕСКЕРТУ (DISCLAIMER):\n"
         "Бұл бот оқу және эксперименттік мақсатта жасалған.\n"
         "Маңызды заңды/медициналық аудармалар үшін қолданбаңыз.\n\n"
-        "Сәлем! Мен QazaqTranslateAI ботымын.\n\n"
-        "Аудару үшін хабарламада 'аудар' сөзін қолданыңыз:\n"
+        "👋 Сәлем! Мен QazaqTranslateAI ботымын.\n\n"
+        "🔤 Аудару үшін хабарламада 'аудар' сөзін қолданыңыз:\n"
         "Мысал: аудар Hello my friend\n"
         "немесе: Сәлем, аудар: I love KZ\n\n"
-        "Тілді таңдаңыз (қай тілден → қай тілге):"
+        "🌍 Тілді таңдаңыз (қай тілден → қай тілге):"
     )
     bot.send_message(chat_id, text, reply_markup=dir_menu("EN", "KZ"))
 
@@ -128,7 +128,7 @@ def callbacks(call):
         bot.answer_callback_query(call.id, f"Таңдалды: {src} → {dst}")
         bot.send_message(
             chat_id,
-            f"Жақсы. Қазір аударма бағыты: {src} → {dst}\nАудару үшін: аудар ... деп жазыңыз.",
+            f"✅ Жақсы! Қазір бағыт: {src} → {dst}\n✍️ Аудару үшін: аудар ... деп жазыңыз.",
             reply_markup=dir_menu(src, dst)
         )
         return
@@ -139,10 +139,10 @@ def callbacks(call):
         bot.answer_callback_query(call.id)
         bot.send_message(
             chat_id,
-            "Қолдану:\n"
+            "ℹ️ Қолдану:\n"
             "1) Кәдімгі сұрақ қойсаңыз — мен қазақша қысқа жауап беремін.\n"
             "2) Аудару керек болса — 'аудар' деп бастап, мәтінді жазыңыз.\n"
-            f"Қазіргі бағыт: {src} → {dst}",
+            f"📌 Қазіргі бағыт: {src} → {dst}",
             reply_markup=dir_menu(src, dst)
         )
         return
@@ -166,28 +166,28 @@ def handle_text(msg):
     try:
         bot.send_chat_action(chat_id, "typing")
 
-        # If user says thanks -> fixed polite reply (no extra questions)
+        # thanks -> fixed reply (no extra questions)
         if is_thanks(text) and "аудар" not in text.lower():
-            bot.send_message(chat_id, "Әрқашан көмектесуге дайынмын!", reply_markup=dir_menu(src, dst))
+            bot.send_message(chat_id, "Әрқашан көмектесуге дайынмын 😊", reply_markup=dir_menu(src, dst))
             return
 
-        # Translation only when "аудар" is used
+        # translation when "аудар" used
         payload = parse_audar_command(text)
         if payload:
             translated = translate_text(payload, src, dst)
             bot.send_message(
                 chat_id,
-                f"Міне, сіздің аудармаңыз ({src} → {dst}):\n{translated}",
+                f"✅ Міне, сіздің аудармаңыз ({src} → {dst}):\n{translated}",
                 reply_markup=dir_menu(src, dst)
             )
             return
 
-        # Normal assistant reply (Kazakh, short, no markdown)
+        # normal assistant reply
         answer = assistant_reply_kz(text)
         bot.send_message(chat_id, answer, reply_markup=dir_menu(src, dst))
 
     except Exception as e:
-        bot.send_message(chat_id, f"Қате: {e}", reply_markup=dir_menu(src, dst))
+        bot.send_message(chat_id, f"⚠️ Қате: {e}", reply_markup=dir_menu(src, dst))
 
 if __name__ == "__main__":
     print("Bot is running...")
