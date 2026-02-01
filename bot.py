@@ -4,29 +4,33 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from openai import OpenAI
 
-# ====== ENV (Railway Variables) ======
-BOT_TOKEN = os.getenv("BOT_TOKEN")          # <-- как у тебя в Railway
+# ===== ENV =====
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set. Add it in Railway Variables (BOT_TOKEN).")
+    raise RuntimeError("BOT_TOKEN is not set")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set. Add it in Railway Variables (OPENAI_API_KEY).")
+    raise RuntimeError("OPENAI_API_KEY is not set")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== User state (direction per user) ======
-# chat_id -> ("EN","KZ") etc
-user_direction = {}
+# ===== USER STATE =====
+# chat_id -> dict
+users = {}
 
-LANG_NAME = {
-    "EN": "English",
-    "KZ": "Kazakh",
-    "RU": "Russian"
-}
-
+# ===== MENUS =====
 def main_menu():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔵 Аударма", callback_data="MODE_TRANSLATE"),
+        InlineKeyboardButton("🟢 Әңгіме", callback_data="MODE_CHAT"),
+    )
+    kb.add(InlineKeyboardButton("ℹ️ Көмек", callback_data="HELP"))
+    return kb
+
+def translate_menu():
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("EN → KZ", callback_data="DIR_EN_KZ"),
@@ -36,111 +40,117 @@ def main_menu():
         InlineKeyboardButton("EN → RU", callback_data="DIR_EN_RU"),
         InlineKeyboardButton("RU → EN", callback_data="DIR_RU_EN"),
     )
-    kb.add(InlineKeyboardButton("ℹ️ Help", callback_data="HELP"))
+    kb.add(InlineKeyboardButton("⬅️ Артқа", callback_data="BACK"))
     return kb
 
-def translate_with_gpt(text: str, src: str, dst: str) -> str:
+# ===== GPT FUNCTIONS =====
+def gpt_translate(text, src, dst):
     system = (
         "You are a professional translator. "
-        "Translate accurately, preserve meaning, tone, and formatting. "
-        "Do NOT add explanations. Output ONLY the translated text."
+        "Translate accurately. Do not add explanations."
     )
+    prompt = f"Translate from {src} to {dst}:\n{text}"
 
-    prompt = (
-        f"Source language: {LANG_NAME[src]}\n"
-        f"Target language: {LANG_NAME[dst]}\n\n"
-        f"Text:\n{text}"
-    )
-
-    resp = client.responses.create(
+    r = client.responses.create(
         model="gpt-5.2",
         input=[
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
     )
+    return r.output_text().strip()
 
-    # robust output parsing
-    out = getattr(resp, "output_text", None)
-    if callable(out):
-        return out().strip()
-    if isinstance(out, str):
-        return out.strip()
-    try:
-        return resp.output[0].content[0].text.strip()
-    except Exception:
-        return "⚠️ Error: could not read model output."
+def gpt_chat(text):
+    system = (
+        "Sen aqылды, сыпайы көмекші ИИ-сің. "
+        "Барлық жауаптарды ҚАЗАҚ тілінде бер. "
+        "Жауаптар түсінікті, нақты және достық стильде болсын."
+    )
 
+    r = client.responses.create(
+        model="gpt-5.2",
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": text},
+        ],
+    )
+    return r.output_text().strip()
+
+# ===== COMMANDS =====
 @bot.message_handler(commands=["start"])
-def start(message):
-    chat_id = message.chat.id
-    user_direction[chat_id] = ("EN", "KZ")  # default
+def start(msg):
+    chat_id = msg.chat.id
+    users[chat_id] = {
+        "mode": "CHAT",
+        "dir": ("EN", "KZ")
+    }
 
     bot.send_message(
         chat_id,
-        "⚠️ DISCLAIMER:\n"
-        "This bot is for educational/experimental purposes.\n"
-        "Do not rely on it for critical/legal/medical translations.\n\n"
-        "Choose translation direction:",
+        "⚠️ *ЕСКЕРТУ (DISCLAIMER):*\n"
+        "Бұл бот оқу және эксперименттік мақсатта жасалған.\n"
+        "Заңды, медициналық немесе маңызды аудармалар үшін қолданбаңыз.\n\n"
+        "👋 *Сәлем!* Мен *QazaqTranslateAI* ботымын.\n"
+        "Мен сенімен қазақ тілінде сөйлесе аламын және мәтіндерді аудара аламын.\n\n"
+        "Режимді таңда:",
+        parse_mode="Markdown",
         reply_markup=main_menu()
     )
 
-@bot.callback_query_handler(func=lambda call: True)
-def on_callback(call):
+# ===== CALLBACKS =====
+@bot.callback_query_handler(func=lambda c: True)
+def callbacks(call):
     chat_id = call.message.chat.id
     data = call.data
 
-    if data == "HELP":
-        src, dst = user_direction.get(chat_id, ("EN", "KZ"))
-        bot.answer_callback_query(call.id)
+    if data == "MODE_CHAT":
+        users[chat_id]["mode"] = "CHAT"
+        bot.send_message(chat_id, "🟢 Әңгіме режимі қосылды. Маған жаза бер 🙂")
+
+    elif data == "MODE_TRANSLATE":
+        users[chat_id]["mode"] = "TRANSLATE"
+        bot.send_message(chat_id, "🔵 Аударма режимі. Бағытты таңда:", reply_markup=translate_menu())
+
+    elif data.startswith("DIR_"):
+        _, src, dst = data.split("_")
+        users[chat_id]["dir"] = (src, dst)
+        bot.send_message(chat_id, f"✅ Аударма бағыты: {src} → {dst}\nМәтін жібер.")
+
+    elif data == "HELP":
         bot.send_message(
             chat_id,
-            f"Current direction: {src} → {dst}\n"
-            "Send me any text, and I will translate it.\n"
-            "Use buttons to change direction.",
-            reply_markup=main_menu()
+            "ℹ️ *Көмек*\n\n"
+            "🟢 Әңгіме – ботпен қазақ тілінде сөйлесу\n"
+            "🔵 Аударма – тілдер арасында аудару\n\n"
+            "Режимді батырмалар арқылы таңда.",
+            parse_mode="Markdown"
         )
-        return
 
-    if data.startswith("DIR_"):
-        parts = data.split("_")
-        # DIR_EN_KZ -> ["DIR","EN","KZ"]
-        if len(parts) == 3:
-            src, dst = parts[1], parts[2]
-            user_direction[chat_id] = (src, dst)
-            bot.answer_callback_query(call.id, f"Direction set: {src} → {dst}")
-            bot.send_message(
-                chat_id,
-                f"✅ Now translating: {src} → {dst}\nSend text:",
-                reply_markup=main_menu()
-            )
-            return
+    elif data == "BACK":
+        bot.send_message(chat_id, "Басты мәзір:", reply_markup=main_menu())
 
-    bot.answer_callback_query(call.id, "Unknown action")
-
+# ===== TEXT HANDLER =====
 @bot.message_handler(content_types=["text"])
-def on_text(message):
-    chat_id = message.chat.id
-    text = message.text.strip()
+def handle_text(msg):
+    chat_id = msg.chat.id
+    text = msg.text.strip()
 
-    if not text:
-        return
-
-    src, dst = user_direction.get(chat_id, ("EN", "KZ"))
+    mode = users.get(chat_id, {}).get("mode", "CHAT")
 
     try:
         bot.send_chat_action(chat_id, "typing")
-        translated = translate_with_gpt(text, src, dst)
 
-        # Telegram safety length
-        if len(translated) > 3500:
-            translated = translated[:3500] + "\n\n…(cut)"
+        if mode == "CHAT":
+            answer = gpt_chat(text)
+        else:
+            src, dst = users[chat_id]["dir"]
+            answer = gpt_translate(text, src, dst)
 
-        bot.send_message(chat_id, translated, reply_markup=main_menu())
+        bot.send_message(chat_id, answer)
 
     except Exception as e:
-        bot.send_message(chat_id, f"⚠️ Error: {e}")
+        bot.send_message(chat_id, f"⚠️ Қате: {e}")
 
-if __name__ == "__main__":
-    print("Bot is running...")
-    bot.infinity_polling(skip_pending=True)
+# ===== RUN =====
+print("Bot started...")
+bot.infinity_polling(skip_pending=True)
