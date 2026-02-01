@@ -2,6 +2,7 @@
 import os
 import re
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from openai import OpenAI
 
 # ===== ENV (Railway Variables) =====
@@ -16,69 +17,58 @@ if not OPENAI_API_KEY:
 bot = telebot.TeleBot(BOT_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# ===== USER STATE =====
+# chat_id -> {"src": "EN", "dst": "KZ"}
+users = {}
+
+# ===== UI =====
+DIRS = [
+    ("EN", "KZ"),
+    ("KZ", "EN"),
+    ("RU", "KZ"),
+    ("KZ", "RU"),
+    ("EN", "RU"),
+    ("RU", "EN"),
+]
+
+def dir_menu(current_src="EN", current_dst="KZ"):
+    kb = InlineKeyboardMarkup(row_width=2)
+    for src, dst in DIRS:
+        label = f"{src} → {dst}"
+        if src == current_src and dst == current_dst:
+            label = "✅ " + label
+        kb.add(InlineKeyboardButton(label, callback_data=f"DIR_{src}_{dst}"))
+    kb.add(InlineKeyboardButton("Көмек", callback_data="HELP"))
+    return kb
+
 # ===== Helpers =====
 def get_output_text(resp) -> str:
-    """Compatible with different SDK versions: output_text may be str or callable."""
     out = getattr(resp, "output_text", "")
     if callable(out):
         out = out()
     return str(out).strip()
 
-def detect_target_lang(text: str) -> str:
-    """
-    Decide target language for translation:
-    - If text contains Cyrillic and looks Kazakh -> translate to English
-    - If text contains Cyrillic and looks Russian -> translate to Kazakh
-    - If text is mostly Latin -> translate to Kazakh
-    Simple heuristic, good enough for project.
-    """
-    t = text.strip()
-    if not t:
-        return "KZ"
+def parse_audar_command(text: str):
+    # "аудар Hello" OR "Сәлем, аудар: Hello"
+    m = re.search(r"\bаудар\b\s*[:\-–—,]?\s*(.+)$", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+    payload = m.group(1).strip()
+    return payload if payload else None
 
-    # Cyrillic?
-    if re.search(r"[А-Яа-яӘәІіҢңҒғҮүҰұҚқӨөҺһ]", t):
-        # Kazakh-specific letters present -> likely KZ -> translate to EN
-        if re.search(r"[ӘәІіҢңҒғҮүҰұҚқӨөҺһ]", t):
-            return "EN"
-        # Otherwise assume Russian -> translate to KZ
-        return "KZ"
+def is_thanks(text: str) -> bool:
+    t = text.lower()
+    keys = ["рақмет", "рахмет", "спасибо", "thank", "thx"]
+    return any(k in t for k in keys)
 
-    # Latin -> translate to KZ
-    return "KZ"
-
-def gpt_translate(text: str, target_lang: str) -> str:
-    """
-    Translate text into target_lang (KZ/EN/RU).
-    Output only translation. Kazakh preferred when target_lang=KZ.
-    """
+def assistant_reply_kz(user_text: str) -> str:
+    # No markdown, no lists, short answers, no "explain the phrase" unless asked
     system = (
-        "You are a professional translator. "
-        "Translate accurately, preserve meaning and tone. "
-        "Do NOT add explanations. Output ONLY the translated text."
+        "Sen qazaq tilinde jauap beretin AI-komekshisinsin. "
+        "Jauap qysqa jane naqty bolsyn (1-3 jūyeler). "
+        "Eshqandai Markdown qoldanba: *, **, #, •, тізімдер, код блоктар жоқ. "
+        "Adam 'tusindir', 'nеге', 'толық' dep suramasa — analiz/tusindirme jasama."
     )
-
-    prompt = f"Target language: {target_lang}\n\nText:\n{text}"
-
-    resp = client.responses.create(
-        model="gpt-5.2",
-        input=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return get_output_text(resp)
-
-def gpt_assistant_reply(user_text: str) -> str:
-    """
-    General assistant reply in Kazakh.
-    """
-    system = (
-        "Sen aqyldy, sypaiy, paydaly IІ-komekshisinsin. "
-        "Barlyk jauaptardy tek QAZAQ tilinde ber. "
-        "Jauaptar anyq, tusinikti, qysqa bolsyn, biraq jetkilikti aqparat bersin."
-    )
-
     resp = client.responses.create(
         model="gpt-5.2",
         input=[
@@ -88,50 +78,76 @@ def gpt_assistant_reply(user_text: str) -> str:
     )
     return get_output_text(resp)
 
-def parse_audar_command(text: str):
-    """
-    If message contains 'аудар' (case-insensitive), return the part after it.
-    Examples:
-    - "аудар Hello" -> "Hello"
-    - "Сәлем, аудар: I love KZ" -> "I love KZ"
-    - "аудар, привет" -> "привет"
-    If no 'аудар' found or nothing after -> None
-    """
-    m = re.search(r"\bаудар\b\s*[:\-–—,]?\s*(.+)$", text, flags=re.IGNORECASE)
-    if not m:
-        return None
-    payload = m.group(1).strip()
-    return payload if payload else None
+def translate_text(text: str, src: str, dst: str) -> str:
+    system = (
+        "You are a professional translator. "
+        "Translate accurately, preserve meaning and tone. "
+        "Do NOT add explanations. Output ONLY the translated text. "
+        "No Markdown, no asterisks, no bullet lists."
+    )
+    prompt = f"Source language: {src}\nTarget language: {dst}\n\nText:\n{text}"
+    resp = client.responses.create(
+        model="gpt-5.2",
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return get_output_text(resp)
 
 # ===== Commands =====
 @bot.message_handler(commands=["start"])
 def start(msg):
-    bot.send_message(
-        msg.chat.id,
-        "⚠️ *ЕСКЕРТУ (DISCLAIMER):*\n"
+    chat_id = msg.chat.id
+    users[chat_id] = {"src": "EN", "dst": "KZ"}
+
+    text = (
+        "ЕСКЕРТУ (DISCLAIMER):\n"
         "Бұл бот оқу және эксперименттік мақсатта жасалған.\n"
         "Маңызды заңды/медициналық аудармалар үшін қолданбаңыз.\n\n"
-        "👋 *Сәлем!* Мен *QazaqTranslateAI* ботымын.\n"
-        "Мен қазақ тілінде жауап беремін және аударма жасай аламын.\n\n"
-        "✅ *Қалай қолдану керек:*\n"
-        "• Жай сұрақ қой: _«Сәлем, қалайсың?»_ — мен жауап беремін.\n"
-        "• Аудару үшін сөйлемнің ішіне *аудар* сөзін жаз:\n"
-        "  _«аудар Hello my friend»_ немесе _«Сәлем, аудар: I love KZ»_\n",
-        parse_mode="Markdown"
+        "Сәлем! Мен QazaqTranslateAI ботымын.\n\n"
+        "Аудару үшін хабарламада 'аудар' сөзін қолданыңыз:\n"
+        "Мысал: аудар Hello my friend\n"
+        "немесе: Сәлем, аудар: I love KZ\n\n"
+        "Тілді таңдаңыз (қай тілден → қай тілге):"
     )
+    bot.send_message(chat_id, text, reply_markup=dir_menu("EN", "KZ"))
 
-@bot.message_handler(commands=["help"])
-def help_cmd(msg):
-    bot.send_message(
-        msg.chat.id,
-        "ℹ️ *Көмек*\n\n"
-        "Бот әрқашан қазақ тілінде жауап береді.\n"
-        "Аударма қажет болса, мәтіннің алдында немесе ішінде *аудар* деп жаз.\n\n"
-        "Мысал:\n"
-        "• аудар Hello, how are you?\n"
-        "• Сәлем, аудар: Мен бүгін сабаққа бардым.\n",
-        parse_mode="Markdown"
-    )
+@bot.callback_query_handler(func=lambda c: True)
+def callbacks(call):
+    chat_id = call.message.chat.id
+    data = call.data
+
+    if chat_id not in users:
+        users[chat_id] = {"src": "EN", "dst": "KZ"}
+
+    if data.startswith("DIR_"):
+        _, src, dst = data.split("_", 2)
+        users[chat_id]["src"] = src
+        users[chat_id]["dst"] = dst
+        bot.answer_callback_query(call.id, f"Таңдалды: {src} → {dst}")
+        bot.send_message(
+            chat_id,
+            f"Жақсы. Қазір аударма бағыты: {src} → {dst}\nАудару үшін: аудар ... деп жазыңыз.",
+            reply_markup=dir_menu(src, dst)
+        )
+        return
+
+    if data == "HELP":
+        src = users[chat_id]["src"]
+        dst = users[chat_id]["dst"]
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "Қолдану:\n"
+            "1) Кәдімгі сұрақ қойсаңыз — мен қазақша қысқа жауап беремін.\n"
+            "2) Аудару керек болса — 'аудар' деп бастап, мәтінді жазыңыз.\n"
+            f"Қазіргі бағыт: {src} → {dst}",
+            reply_markup=dir_menu(src, dst)
+        )
+        return
+
+    bot.answer_callback_query(call.id, "OK")
 
 # ===== Main handler =====
 @bot.message_handler(content_types=["text"])
@@ -141,31 +157,37 @@ def handle_text(msg):
     if not text:
         return
 
+    if chat_id not in users:
+        users[chat_id] = {"src": "EN", "dst": "KZ"}
+
+    src = users[chat_id]["src"]
+    dst = users[chat_id]["dst"]
+
     try:
         bot.send_chat_action(chat_id, "typing")
 
-        # 1) Translation mode only if 'аудар' exists
-        payload = parse_audar_command(text)
-        if payload:
-            target = detect_target_lang(payload)  # KZ or EN, simple auto
-            translated = gpt_translate(payload, target_lang=target)
-
-            if target == "KZ":
-                header = "✅ *Міне, сіздің аудармаңыз (қазақша):*\n"
-            elif target == "EN":
-                header = "✅ *Міне, сіздің аудармаңыз (English):*\n"
-            else:
-                header = "✅ *Міне, сіздің аудармаңыз:*\n"
-
-            bot.send_message(chat_id, header + translated, parse_mode="Markdown")
+        # If user says thanks -> fixed polite reply (no extra questions)
+        if is_thanks(text) and "аудар" not in text.lower():
+            bot.send_message(chat_id, "Әрқашан көмектесуге дайынмын!", reply_markup=dir_menu(src, dst))
             return
 
-        # 2) Otherwise: normal assistant chat in Kazakh
-        answer = gpt_assistant_reply(text)
-        bot.send_message(chat_id, answer)
+        # Translation only when "аудар" is used
+        payload = parse_audar_command(text)
+        if payload:
+            translated = translate_text(payload, src, dst)
+            bot.send_message(
+                chat_id,
+                f"Міне, сіздің аудармаңыз ({src} → {dst}):\n{translated}",
+                reply_markup=dir_menu(src, dst)
+            )
+            return
+
+        # Normal assistant reply (Kazakh, short, no markdown)
+        answer = assistant_reply_kz(text)
+        bot.send_message(chat_id, answer, reply_markup=dir_menu(src, dst))
 
     except Exception as e:
-        bot.send_message(chat_id, f"⚠️ Қате: {e}")
+        bot.send_message(chat_id, f"Қате: {e}", reply_markup=dir_menu(src, dst))
 
 if __name__ == "__main__":
     print("Bot is running...")
